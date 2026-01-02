@@ -119,31 +119,20 @@ class ModelRunner:
     return input_ids, positions
 
   def prepare_decode(self, seqs: list[Sequence]):
-    # TEMPORARY: Recompute full sequence on each step (slow but correct without KV cache)
-    # This treats decode like prefill - reprocesses all tokens
+    # Decode phase: only process the last token of each sequence
+    # Use cached KV from previous tokens (stored in attention layers)
     input_ids = []
     positions = []
-    cu_seqlens_q = [0]
-    cu_seqlens_k = [0]
-    max_seqlen_q = 0
-    max_seqlen_k = 0
 
     for seq in seqs:
-      seqlen = len(seq)
-      input_ids.extend(seq.token_ids)  # All tokens, not just last
-      positions.extend(list(range(seqlen)))
-      cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen)
-      cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen)
-      max_seqlen_q = max(seqlen, max_seqlen_q)
-      max_seqlen_k = max(seqlen, max_seqlen_k)
+      input_ids.append(seq.last_token)
+      positions.append(len(seq) - 1)
 
     input_ids = Tensor(input_ids, dtype=dtypes.int64)
     positions = Tensor(positions, dtype=dtypes.int64)
-    cu_seqlens_q = Tensor(cu_seqlens_q, dtype=dtypes.int32)
-    cu_seqlens_k = Tensor(cu_seqlens_k, dtype=dtypes.int32)
-    slot_mapping = Tensor([], dtype=dtypes.int32)
 
-    set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, None)
+    # Simple decode context - no slot mapping needed for simple cache
+    set_context(False)
     return input_ids, positions
 
   def prepare_sample(self, seqs: list[Sequence]):
@@ -152,6 +141,12 @@ class ModelRunner:
     return temperatures
 
   def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    # Reset cache for new sequences in prefill
+    if is_prefill:
+      for layer in self.model.model.layers:
+        if hasattr(layer.self_attn, 'attn') and hasattr(layer.self_attn.attn, 'reset_cache'):
+          layer.self_attn.attn.reset_cache()
+
     input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
     temperatures = self.prepare_sample(seqs)
 

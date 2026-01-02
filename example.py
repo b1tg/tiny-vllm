@@ -35,11 +35,13 @@ def main():
     for prompt in prompts
   ]
   outputs = llm.generate(prompts, sampling_params)
-
+  result = ""
   for prompt, output in zip(prompts, outputs):
     print("\n")
     print(f"Prompt: {prompt!r}")
     print(f"Completion: {output['text']!r}")
+    result += output['text']
+  assert "Okay," in result, result
 
 
 if __name__ == "__main__":
