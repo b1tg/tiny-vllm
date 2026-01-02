@@ -20,6 +20,10 @@ def main():
 
   sampling_params = SamplingParams(temperature=0.6, max_tokens=10)  # Reduced for testing
   prompts = [
+      "introduce yourself",
+      "list all prime numbers within 100",
+  ]
+  prompts = [
     "Hello",  # Shorter prompt for testing
   ]
   prompts = [

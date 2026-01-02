@@ -39,7 +39,7 @@ class Attention:
     # Apply causal mask
     N = q.shape[1]
     mask = Tensor.ones(N, N).tril(0).reshape(1, N, N)
-    attn_scores = attn_scores.where(mask, float('-inf'))
+    attn_scores = mask.where(attn_scores, float('-inf'))
 
     # Softmax and weighted sum
     attn_probs = attn_scores.softmax(axis=-1)
