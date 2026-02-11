@@ -20,6 +20,8 @@ class VocabParallelEmbedding:
     shard_size = param_data.shape[0]
     start_idx = self.tp_rank * shard_size
     loaded_weight = loaded_weight.shrink(((start_idx, start_idx + shard_size), None))
+    if param_data.dtype != loaded_weight.dtype:
+      loaded_weight = loaded_weight.cast(param_data.dtype)
     param_data.assign(loaded_weight)
 
   def __call__(self, x: Tensor):

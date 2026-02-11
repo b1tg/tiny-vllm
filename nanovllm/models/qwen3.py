@@ -1,155 +1,87 @@
-from tinygrad import Tensor
+from tinygrad import Tensor, UOp, nn
 from transformers import Qwen3Config
 
-from nanovllm.layers.activation import SiluAndMul
-from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import RMSNorm
+from nanovllm.layers.rotary_embedding import precompute_freqs_cis, apply_rope
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
-from nanovllm.layers.rotary_embedding import get_rope
-from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
-class Qwen3Attention:
-
-  def __init__(
-    self,
-    hidden_size: int,
-    num_heads: int,
-    num_kv_heads: int,
-    max_position: int = 4096 * 32,
-    head_dim: int | None = None,
-    rms_norm_eps: float = 1e-06,
-    qkv_bias: bool = False,
-    rope_theta: float = 10000,
-    rope_scaling: tuple | None = None,
-  ):
-    tp_size = 1  # Single-GPU
-    self.total_num_heads = num_heads
-    assert self.total_num_heads % tp_size == 0
-    self.num_heads = self.total_num_heads // tp_size
-    self.total_num_kv_heads = num_kv_heads
-    assert self.total_num_kv_heads % tp_size == 0
-    self.num_kv_heads = self.total_num_kv_heads // tp_size
-    self.head_dim = head_dim or hidden_size // self.total_num_heads
-    self.q_size = self.num_heads * self.head_dim
-    self.kv_size = self.num_kv_heads * self.head_dim
-    self.scaling = self.head_dim ** -0.5
-    self.qkv_bias = qkv_bias
-
-    self.qkv_proj = QKVParallelLinear(
-      hidden_size,
-      self.head_dim,
-      self.total_num_heads,
-      self.total_num_kv_heads,
-      bias=qkv_bias,
-    )
-    self.o_proj = RowParallelLinear(
-      self.total_num_heads * self.head_dim,
-      hidden_size,
-      bias=False,
-    )
-    self.rotary_emb = get_rope(
-      self.head_dim,
-      rotary_dim=self.head_dim,
-      max_position=max_position,
-      base=rope_theta,
-      rope_scaling=rope_scaling,
-    )
-    self.attn = Attention(
-      self.num_heads,
-      self.head_dim,
-      self.scaling,
-      self.num_kv_heads,
-    )
-    if not self.qkv_bias:
-      self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-      self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-
-  def __call__(self, positions: Tensor, hidden_states: Tensor) -> Tensor:
-    qkv = self.qkv_proj(hidden_states)
-    q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-    q = q.reshape(-1, self.num_heads, self.head_dim)
-    k = k.reshape(-1, self.num_kv_heads, self.head_dim)
-    v = v.reshape(-1, self.num_kv_heads, self.head_dim)
-    if not self.qkv_bias:
-      q = self.q_norm(q)
-      k = self.k_norm(k)
-    q, k = self.rotary_emb(positions, q, k)
-    o = self.attn(q, k, v)
-    output = self.o_proj(o.flatten(1, -1))
-    return output
-
-
-class Qwen3MLP:
-
-  def __init__(self, hidden_size: int, intermediate_size: int, hidden_act: str):
-    self.gate_up_proj = MergedColumnParallelLinear(
-      hidden_size,
-      [intermediate_size] * 2,
-      bias=False,
-    )
-    self.down_proj = RowParallelLinear(
-      intermediate_size,
-      hidden_size,
-      bias=False,
-    )
-    assert hidden_act == "silu"
-    self.act_fn = SiluAndMul()
-
-  def __call__(self, x):
-    gate_up = self.gate_up_proj(x)
-    x = self.act_fn(gate_up)
-    x = self.down_proj(x)
-    return x
-
-
-class Qwen3DecoderLayer:
+class Qwen3Block:
 
   def __init__(self, config: Qwen3Config):
-    self.self_attn = Qwen3Attention(
-      hidden_size=config.hidden_size,
-      num_heads=config.num_attention_heads,
-      num_kv_heads=config.num_key_value_heads,
-      max_position=config.max_position_embeddings,
-      rms_norm_eps=config.rms_norm_eps,
-      qkv_bias=getattr(config, 'attention_bias', True),
-      head_dim=getattr(config, 'head_dim', None),
-      rope_theta=getattr(config, "rope_theta", 1000000),
-      rope_scaling=getattr(config, "rope_scaling", None),
-    )
-    self.mlp = Qwen3MLP(
-      hidden_size=config.hidden_size,
-      intermediate_size=config.intermediate_size,
-      hidden_act=config.hidden_act,
-    )
-    self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-    self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+    dim = config.hidden_size
+    hidden_dim = config.intermediate_size
+    n_heads = config.num_attention_heads
+    n_kv_heads = config.num_key_value_heads
+    head_dim = getattr(config, 'head_dim', None) or dim // n_heads
+    norm_eps = config.rms_norm_eps
+    rope_theta = getattr(config, "rope_theta", 1000000)
+    max_context = config.max_position_embeddings
+    qkv_bias = getattr(config, 'attention_bias', True)
 
-  def __call__(self, positions: Tensor, hidden_states: Tensor, residual: Tensor | None) -> tuple[Tensor, Tensor]:
-    if residual is None:
-      hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
-    else:
-      hidden_states, residual = self.input_layernorm(hidden_states, residual)
-    hidden_states = self.self_attn(positions, hidden_states)
-    hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-    hidden_states = self.mlp(hidden_states)
-    return hidden_states, residual
+    self.n_heads = n_heads
+    self.n_kv_heads = n_kv_heads
+    self.head_dim = head_dim
+    self.rope_theta = rope_theta
+    self.max_context = max_context
+    self.qk_norm = 0 if qkv_bias else head_dim
 
+    # Attention projections
+    self.attn_qkv = QKVParallelLinear(dim, head_dim, n_heads, n_kv_heads, bias=qkv_bias)
+    self.attn_output = RowParallelLinear(n_heads * head_dim, dim, bias=False)
 
-class Qwen3Model:
+    # RMSNorms
+    self.attn_norm = RMSNorm(dim, norm_eps)
+    self.ffn_norm = RMSNorm(dim, norm_eps)
+    if self.qk_norm:
+      self.attn_q_norm = RMSNorm(head_dim, norm_eps)
+      self.attn_k_norm = RMSNorm(head_dim, norm_eps)
 
-  def __init__(self, config: Qwen3Config):
-    self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-    self.layers = [Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)]
-    self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+    # Feed-forward
+    self.ffn_gate_up = MergedColumnParallelLinear(dim, [hidden_dim] * 2, bias=False)
+    self.ffn_down = RowParallelLinear(hidden_dim, dim, bias=False)
 
-  def __call__(self, input_ids: Tensor, positions: Tensor) -> Tensor:
-    hidden_states = self.embed_tokens(input_ids)
-    residual = None
-    for layer in self.layers:
-      hidden_states, residual = layer(positions, hidden_states, residual)
-    hidden_states, _ = self.norm(hidden_states, residual)
-    return hidden_states
+  def _attention(self, x: Tensor, start_pos: int | UOp) -> Tensor:
+    x_norm = self.attn_norm(x)
+    B, T, _ = x.shape
+
+    qkv = self.attn_qkv(x_norm)
+    q_size = self.n_heads * self.head_dim
+    kv_size = self.n_kv_heads * self.head_dim
+    q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+
+    q = q.reshape(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+    k = k.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+    v = v.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+
+    if self.qk_norm:
+      q, k = self.attn_q_norm(q), self.attn_k_norm(k)
+
+    freqs_cis = precompute_freqs_cis(self.head_dim, self.max_context, self.rope_theta)[start_pos:start_pos+T]
+    q = apply_rope(q, freqs_cis)
+    k = apply_rope(k, freqs_cis)
+
+    # KV cache
+    if not hasattr(self, "cache_kv"):
+      self.cache_kv = Tensor.zeros(2, B, self.n_kv_heads, self.max_context, self.head_dim, dtype=k.dtype, device=k.device).contiguous().realize()
+    self.cache_kv[:, :, :, start_pos:start_pos+T, :].assign(Tensor.stack(k, v)).realize()
+    k = self.cache_kv[0, :, :, 0:start_pos+T, :]
+    v = self.cache_kv[1, :, :, 0:start_pos+T, :]
+
+    mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, device=x.device).triu(int(start_pos)+1) if T > 1 else None
+    attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
+    attn = attn.transpose(1, 2).reshape(B, T, -1)
+    attn = self.attn_output(attn)
+    return x + attn
+
+  def _feed_forward(self, h: Tensor) -> Tensor:
+    h_norm = self.ffn_norm(h)
+    gate_up = self.ffn_gate_up(h_norm)
+    gate, up = gate_up.chunk(2, -1)
+    return h + self.ffn_down(gate.silu().contiguous() * up)
+
+  def __call__(self, x: Tensor, start_pos: int | UOp):
+    return self._feed_forward(self._attention(x, start_pos)).contiguous()
 
 
 class Qwen3ForCausalLM:
@@ -161,14 +93,27 @@ class Qwen3ForCausalLM:
     "up_proj": ("gate_up_proj", 1),
   }
 
+  # Weight name mapping from HF format to our format
+  weight_name_mapping = {
+    "model.embed_tokens.weight": "embed_tokens.weight",
+    "model.norm.weight": "output_norm.weight",
+    "lm_head.weight": "output.weight",
+  }
+
   def __init__(self, config: Qwen3Config):
-    self.model = Qwen3Model(config)
-    self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+    self.max_context = config.max_position_embeddings
+    self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+    self.blk = [Qwen3Block(config) for _ in range(config.num_hidden_layers)]
+    self.output_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+    self.output = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
     if config.tie_word_embeddings:
-      self.lm_head.weight = self.model.embed_tokens.weight
+      self.output.weight = self.embed_tokens.weight
 
-  def __call__(self, input_ids: Tensor, positions: Tensor) -> Tensor:
-    return self.model(input_ids, positions)
+  def forward(self, tokens: Tensor, start_pos: int | UOp) -> Tensor:
+    x = self.embed_tokens(tokens)
+    for block in self.blk:
+      x = block(x, start_pos)
+    return self.output(self.output_norm(x))
 
-  def compute_logits(self, hidden_states: Tensor) -> Tensor:
-    return self.lm_head(hidden_states)
+  def __call__(self, tokens: Tensor, start_pos: int | UOp) -> Tensor:
+    return self.forward(tokens, start_pos)

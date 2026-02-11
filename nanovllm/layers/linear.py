@@ -28,6 +28,8 @@ class ReplicatedLinear(LinearBase):
       self.bias.weight_loader = self._weight_loader_impl
 
   def _weight_loader_impl(self, param: Tensor, loaded_weight: Tensor):
+    if param.dtype != loaded_weight.dtype:
+      loaded_weight = loaded_weight.cast(param.dtype)
     param.assign(loaded_weight)
 
   def __call__(self, x: Tensor) -> Tensor:
@@ -51,6 +53,8 @@ class ColumnParallelLinear(LinearBase):
     shard_size = param_data.shape[self.tp_dim]
     start_idx = self.tp_rank * shard_size
     loaded_weight = loaded_weight.shrink(((start_idx, start_idx + shard_size), None) if self.tp_dim == 0 else (None, (start_idx, start_idx + shard_size)))
+    if param_data.dtype != loaded_weight.dtype:
+      loaded_weight = loaded_weight.cast(param_data.dtype)
     param_data.assign(loaded_weight)
 
   def __call__(self, x: Tensor) -> Tensor:
@@ -70,12 +74,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     self.weight.weight_loader = self._weight_loader_impl
 
   def _weight_loader_impl(self, param: Tensor, loaded_weight: Tensor, loaded_shard_id: int):
-    # Store the loaded weight for this shard
+    if param.dtype != loaded_weight.dtype:
+      loaded_weight = loaded_weight.cast(param.dtype)
     self._loaded_weights[loaded_shard_id] = loaded_weight
 
-    # Check if all shards have been loaded
     if len(self._loaded_weights) == len(self.output_sizes):
-      # Concatenate all weights in order
       weights_list = [self._loaded_weights[i] for i in range(len(self.output_sizes))]
       full_weight = weights_list[0].cat(*weights_list[1:], dim=0)
       param.assign(full_weight)
@@ -98,12 +101,11 @@ class QKVParallelLinear(ColumnParallelLinear):
 
   def _weight_loader_impl(self, param: Tensor, loaded_weight: Tensor, loaded_shard_id: str):
     assert loaded_shard_id in ["q", "k", "v"]
-    # Store the loaded weight
+    if param.dtype != loaded_weight.dtype:
+      loaded_weight = loaded_weight.cast(param.dtype)
     self._loaded_weights[loaded_shard_id] = loaded_weight
 
-    # Check if all three (q, k, v) have been loaded
     if len(self._loaded_weights) == 3:
-      # Concatenate in order: q, k, v
       full_weight = self._loaded_weights["q"].cat(self._loaded_weights["k"], self._loaded_weights["v"], dim=0)
       param.assign(full_weight)
       self._loaded_weights.clear()
@@ -123,6 +125,8 @@ class RowParallelLinear(LinearBase):
     shard_size = param_data.shape[self.tp_dim]
     start_idx = self.tp_rank * shard_size
     loaded_weight = loaded_weight.shrink((None, (start_idx, start_idx + shard_size)) if self.tp_dim == 1 else ((start_idx, start_idx + shard_size), None))
+    if param_data.dtype != loaded_weight.dtype:
+      loaded_weight = loaded_weight.cast(param_data.dtype)
     param_data.assign(loaded_weight)
 
   def __call__(self, x: Tensor) -> Tensor:
